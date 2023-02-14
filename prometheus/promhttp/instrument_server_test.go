@@ -17,11 +17,16 @@ import (
 	"context"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestLabelCheck(t *testing.T) {
@@ -423,6 +428,47 @@ func TestMiddlewareAPI(t *testing.T) {
 	chain.ServeHTTP(w, r)
 
 	assetMetricAndExemplars(t, reg, 5, nil)
+}
+
+func TestMiddlewareAPITimeout(t *testing.T) {
+	lock := &sync.Mutex{}
+
+	chain, reg := makeInstrumentedHandler(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		if err := r.Context().Err(); err == nil {
+			t.Fatal("should have a cancelled context:", err)
+		}
+	})
+	chain = lockAroundHandler(chain, lock)
+
+	server := httptest.NewServer(chain)
+	client := server.Client()
+	client.Timeout = 50 * time.Millisecond
+
+	_, err := client.Get(server.URL)
+	if err == nil || !err.(net.Error).Timeout() {
+		t.Fatal("should have timed out:", err)
+	}
+
+	// This records a 200 status code when it probably shouldn't
+	expected := `
+# HELP api_requests_total A counter for requests to the wrapped handler.
+# TYPE api_requests_total counter
+api_requests_total{code="200",method="get"} 1
+`
+	lock.Lock()
+	err = testutil.GatherAndCompare(reg, strings.NewReader(expected), "api_requests_total")
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func lockAroundHandler(h http.Handler, l sync.Locker) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		l.Lock()
+		defer l.Unlock()
+		h.ServeHTTP(w, r)
+	})
 }
 
 func TestMiddlewareAPI_WithExemplars(t *testing.T) {
